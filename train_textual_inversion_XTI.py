@@ -20,7 +20,13 @@ from library.config_util import (
     BlueprintGenerator,
 )
 import library.custom_train_functions as custom_train_functions
-from library.custom_train_functions import apply_snr_weight
+from library.custom_train_functions import (
+    apply_snr_weight,
+    prepare_scheduler_for_custom_training,
+    pyramid_noise_like,
+    apply_noise_offset,
+    scale_v_prediction_loss_like_noise_prediction,
+)
 from XTI_hijack import unet_forward_XTI, downblock_forward_XTI, upblock_forward_XTI
 
 imagenet_templates_small = [
@@ -88,6 +94,9 @@ def train(args):
         print(
             "sample_every_n_steps and sample_every_n_epochs are not supported in this script currently / sample_every_n_stepsとsample_every_n_epochsは現在このスクリプトではサポートされていません"
         )
+    assert (
+        args.dataset_class is None
+    ), "dataset_class is not supported in this script currently / dataset_classは現在このスクリプトではサポートされていません"
 
     cache_latents = args.cache_latents
 
@@ -104,7 +113,7 @@ def train(args):
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
 
     # モデルを読み込む
-    text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype)
+    text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # Convert the init_word to token_id
     if args.init_word is not None:
@@ -267,11 +276,13 @@ def train(args):
         vae.requires_grad_(False)
         vae.eval()
         with torch.no_grad():
-            train_dataset_group.cache_latents(vae, args.vae_batch_size)
+            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
         vae.to("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+        accelerator.wait_for_everyone()
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -311,6 +322,9 @@ def train(args):
     text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         text_encoder, optimizer, train_dataloader, lr_scheduler
     )
+
+    # transform DDP after prepare
+    text_encoder, unet = train_util.transform_if_model_is_DDP(text_encoder, unet)
 
     index_no_updates = torch.arange(len(tokenizer)) < token_ids_XTI[0]
     # print(len(index_no_updates), torch.sum(index_no_updates))
@@ -367,12 +381,30 @@ def train(args):
     noise_scheduler = DDPMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
     )
+    prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("textual_inversion")
+        accelerator.init_trackers("textual_inversion" if args.log_tracker_name is None else args.log_tracker_name)
 
+    # function for saving/removing
+    def save_model(ckpt_name, embs, steps, epoch_no, force_sync_upload=False):
+        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+
+        print(f"\nsaving checkpoint: {ckpt_file}")
+        save_weights(ckpt_file, embs, save_dtype)
+        if args.huggingface_repo_id is not None:
+            huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+
+    def remove_model(old_ckpt_name):
+        old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
+        if os.path.exists(old_ckpt_file):
+            print(f"removing old checkpoint: {old_ckpt_file}")
+            os.remove(old_ckpt_file)
+
+    # training loop
     for epoch in range(num_train_epochs):
-        print(f"epoch {epoch+1}/{num_train_epochs}")
+        print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
 
         text_encoder.train()
@@ -404,8 +436,9 @@ def train(args):
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents, device=latents.device)
                 if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn((latents.shape[0], latents.shape[1], 1, 1), device=latents.device)
+                    noise = apply_noise_offset(latents, noise, args.noise_offset, args.adaptive_noise_scale)
+                elif args.multires_noise_iterations:
+                    noise = pyramid_noise_like(noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount)
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b_size,), device=latents.device)
@@ -416,7 +449,8 @@ def train(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                with accelerator.autocast():
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
                 if args.v_parameterization:
                     # v-parameterization training
@@ -427,11 +461,13 @@ def train(args):
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 loss = loss.mean([1, 2, 3])
 
+                loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+
+                loss = loss * loss_weights
                 if args.min_snr_gamma:
                     loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
-
-                loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-                loss = loss * loss_weights
+                if args.scale_v_pred_loss_like_noise_pred:
+                    loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
 
                 loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
@@ -459,10 +495,27 @@ def train(args):
                 #     accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet, prompt_replacement
                 # )
 
+                # 指定ステップごとにモデルを保存
+                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        updated_embs = unwrap_model(text_encoder).get_input_embeddings().weight[token_ids_XTI].data.detach().clone()
+
+                        ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                        save_model(ckpt_name, updated_embs, global_step, epoch)
+
+                        if args.save_state:
+                            train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                        remove_step_no = train_util.get_remove_step_no(args, global_step)
+                        if remove_step_no is not None:
+                            remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                            remove_model(remove_ckpt_name)
+
             current_loss = loss.detach().item()
             if args.logging_dir is not None:
                 logs = {"loss": current_loss, "lr": float(lr_scheduler.get_last_lr()[0])}
-                if args.optimizer_type.lower() == "DAdaptation".lower():  # tracking d*lr value
+                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():  # tracking d*lr value
                     logs["lr/d*lr"] = (
                         lr_scheduler.optimizers[0].param_groups[0]["d"] * lr_scheduler.optimizers[0].param_groups[0]["lr"]
                     )
@@ -485,26 +538,18 @@ def train(args):
         updated_embs = unwrap_model(text_encoder).get_input_embeddings().weight[token_ids_XTI].data.detach().clone()
 
         if args.save_every_n_epochs is not None:
-            model_name = train_util.DEFAULT_EPOCH_NAME if args.output_name is None else args.output_name
+            saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
+            if accelerator.is_main_process and saving:
+                ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
+                save_model(ckpt_name, updated_embs, epoch + 1, global_step)
 
-            def save_func():
-                ckpt_name = train_util.EPOCH_FILE_NAME.format(model_name, epoch + 1) + "." + args.save_model_as
-                ckpt_file = os.path.join(args.output_dir, ckpt_name)
-                print(f"saving checkpoint: {ckpt_file}")
-                save_weights(ckpt_file, updated_embs, save_dtype)
-                if args.huggingface_repo_id is not None:
-                    huggingface_util.upload(args, ckpt_file, "/" + ckpt_name)
+                remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
+                if remove_epoch_no is not None:
+                    remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
+                    remove_model(remove_ckpt_name)
 
-            def remove_old_func(old_epoch_no):
-                old_ckpt_name = train_util.EPOCH_FILE_NAME.format(model_name, old_epoch_no) + "." + args.save_model_as
-                old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-                if os.path.exists(old_ckpt_file):
-                    print(f"removing old checkpoint: {old_ckpt_file}")
-                    os.remove(old_ckpt_file)
-
-            saving = train_util.save_on_epoch_end(args, save_func, remove_old_func, epoch + 1, num_train_epochs)
-            if saving and args.save_state:
-                train_util.save_state_on_epoch_end(args, accelerator, model_name, epoch + 1)
+                if args.save_state:
+                    train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
         # TODO: fix sample_images
         # train_util.sample_images(
@@ -519,7 +564,7 @@ def train(args):
 
     accelerator.end_training()
 
-    if args.save_state:
+    if args.save_state and is_main_process:
         train_util.save_state_on_train_end(args, accelerator)
 
     updated_embs = text_encoder.get_input_embeddings().weight[token_ids_XTI].data.detach().clone()
@@ -527,16 +572,9 @@ def train(args):
     del accelerator  # この後メモリを使うのでこれは消す
 
     if is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
+        save_model(ckpt_name, updated_embs, global_step, num_train_epochs, force_sync_upload=True)
 
-        model_name = train_util.DEFAULT_LAST_OUTPUT_NAME if args.output_name is None else args.output_name
-        ckpt_name = model_name + "." + args.save_model_as
-        ckpt_file = os.path.join(args.output_dir, ckpt_name)
-
-        print(f"save trained model to {ckpt_file}")
-        save_weights(ckpt_file, updated_embs, save_dtype)
-        if args.huggingface_repo_id is not None:
-            huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=True)
         print("model saved.")
 
 
@@ -603,7 +641,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_training_arguments(parser, True)
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
-    custom_train_functions.add_custom_train_arguments(parser)
+    custom_train_functions.add_custom_train_arguments(parser, False)
 
     parser.add_argument(
         "--save_model_as",

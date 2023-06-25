@@ -23,7 +23,16 @@ from library.config_util import (
     BlueprintGenerator,
 )
 import library.custom_train_functions as custom_train_functions
-from library.custom_train_functions import apply_snr_weight
+from library.custom_train_functions import (
+    apply_snr_weight,
+    get_weighted_text_embeddings,
+    prepare_scheduler_for_custom_training,
+    pyramid_noise_like,
+    apply_noise_offset,
+    scale_v_prediction_loss_like_noise_prediction,
+)
+
+# perlin_noise,
 
 
 def train(args):
@@ -37,26 +46,30 @@ def train(args):
 
     tokenizer = train_util.load_tokenizer(args)
 
-    blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, False, True))
-    if args.dataset_config is not None:
-        print(f"Load dataset config from {args.dataset_config}")
-        user_config = config_util.load_user_config(args.dataset_config)
-        ignored = ["train_data_dir", "reg_data_dir"]
-        if any(getattr(args, attr) is not None for attr in ignored):
-            print(
-                "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
-                    ", ".join(ignored)
+    # データセットを準備する
+    if args.dataset_class is None:
+        blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, False, True))
+        if args.dataset_config is not None:
+            print(f"Load dataset config from {args.dataset_config}")
+            user_config = config_util.load_user_config(args.dataset_config)
+            ignored = ["train_data_dir", "reg_data_dir"]
+            if any(getattr(args, attr) is not None for attr in ignored):
+                print(
+                    "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
+                        ", ".join(ignored)
+                    )
                 )
-            )
-    else:
-        user_config = {
-            "datasets": [
-                {"subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(args.train_data_dir, args.reg_data_dir)}
-            ]
-        }
+        else:
+            user_config = {
+                "datasets": [
+                    {"subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(args.train_data_dir, args.reg_data_dir)}
+                ]
+            }
 
-    blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
-    train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
+        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    else:
+        train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -92,7 +105,7 @@ def train(args):
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
 
     # モデルを読み込む
-    text_encoder, vae, unet, load_stable_diffusion_format = train_util.load_target_model(args, weight_dtype)
+    text_encoder, vae, unet, load_stable_diffusion_format = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # verify load/save model formats
     if load_stable_diffusion_format:
@@ -118,11 +131,13 @@ def train(args):
         vae.requires_grad_(False)
         vae.eval()
         with torch.no_grad():
-            train_dataset_group.cache_latents(vae, args.vae_batch_size)
+            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
         vae.to("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+        accelerator.wait_for_everyone()
 
     # 学習を準備する：モデルを適切な状態にする
     train_text_encoder = args.stop_text_encoder_training is None or args.stop_text_encoder_training >= 0
@@ -194,6 +209,9 @@ def train(args):
     else:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
 
+    # transform DDP after prepare
+    text_encoder, unet = train_util.transform_if_model_is_DDP(text_encoder, unet)
+
     if not train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)  # to avoid 'cpu' vs 'cuda' error
 
@@ -228,14 +246,15 @@ def train(args):
     noise_scheduler = DDPMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
     )
+    prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth")
+        accelerator.init_trackers("dreambooth" if args.log_tracker_name is None else args.log_tracker_name)
 
     loss_list = []
     loss_total = 0.0
     for epoch in range(num_train_epochs):
-        print(f"epoch {epoch+1}/{num_train_epochs}")
+        print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
 
         # 指定したステップ数までText Encoderを学習する：epoch最初の状態
@@ -266,15 +285,28 @@ def train(args):
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents, device=latents.device)
                 if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn((latents.shape[0], latents.shape[1], 1, 1), device=latents.device)
+                    noise = apply_noise_offset(latents, noise, args.noise_offset, args.adaptive_noise_scale)
+                elif args.multires_noise_iterations:
+                    noise = pyramid_noise_like(noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount)
+                # elif args.perlin_noise:
+                #     noise = perlin_noise(noise, latents.device, args.perlin_noise)  # only shape of noise is used currently
 
                 # Get the text embedding for conditioning
                 with torch.set_grad_enabled(global_step < args.stop_text_encoder_training):
-                    input_ids = batch["input_ids"].to(accelerator.device)
-                    encoder_hidden_states = train_util.get_hidden_states(
-                        args, input_ids, tokenizer, text_encoder, None if not args.full_fp16 else weight_dtype
-                    )
+                    if args.weighted_captions:
+                        encoder_hidden_states = get_weighted_text_embeddings(
+                            tokenizer,
+                            text_encoder,
+                            batch["captions"],
+                            accelerator.device,
+                            args.max_token_length // 75 if args.max_token_length else 1,
+                            clip_skip=args.clip_skip,
+                        )
+                    else:
+                        input_ids = batch["input_ids"].to(accelerator.device)
+                        encoder_hidden_states = train_util.get_hidden_states(
+                            args, input_ids, tokenizer, text_encoder, None if not args.full_fp16 else weight_dtype
+                        )
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b_size,), device=latents.device)
@@ -285,7 +317,8 @@ def train(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                with accelerator.autocast():
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
                 if args.v_parameterization:
                     # v-parameterization training
@@ -301,6 +334,8 @@ def train(args):
 
                 if args.min_snr_gamma:
                     loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                if args.scale_v_pred_loss_like_noise_pred:
+                    loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
 
                 loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
@@ -325,10 +360,31 @@ def train(args):
                     accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet
                 )
 
+                # 指定ステップごとにモデルを保存
+                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+                        train_util.save_sd_model_on_epoch_end_or_stepwise(
+                            args,
+                            False,
+                            accelerator,
+                            src_path,
+                            save_stable_diffusion_format,
+                            use_safetensors,
+                            save_dtype,
+                            epoch,
+                            num_train_epochs,
+                            global_step,
+                            unwrap_model(text_encoder),
+                            unwrap_model(unet),
+                            vae,
+                        )
+
             current_loss = loss.detach().item()
             if args.logging_dir is not None:
                 logs = {"loss": current_loss, "lr": float(lr_scheduler.get_last_lr()[0])}
-                if args.optimizer_type.lower() == "DAdaptation".lower():  # tracking d*lr value
+                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():  # tracking d*lr value
                     logs["lr/d*lr"] = (
                         lr_scheduler.optimizers[0].param_groups[0]["d"] * lr_scheduler.optimizers[0].param_groups[0]["lr"]
                     )
@@ -354,21 +410,24 @@ def train(args):
         accelerator.wait_for_everyone()
 
         if args.save_every_n_epochs is not None:
-            src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-            train_util.save_sd_model_on_epoch_end(
-                args,
-                accelerator,
-                src_path,
-                save_stable_diffusion_format,
-                use_safetensors,
-                save_dtype,
-                epoch,
-                num_train_epochs,
-                global_step,
-                unwrap_model(text_encoder),
-                unwrap_model(unet),
-                vae,
-            )
+            if accelerator.is_main_process:
+                # checking for saving is in util
+                src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+                train_util.save_sd_model_on_epoch_end_or_stepwise(
+                    args,
+                    True,
+                    accelerator,
+                    src_path,
+                    save_stable_diffusion_format,
+                    use_safetensors,
+                    save_dtype,
+                    epoch,
+                    num_train_epochs,
+                    global_step,
+                    unwrap_model(text_encoder),
+                    unwrap_model(unet),
+                    vae,
+                )
 
         train_util.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
@@ -379,7 +438,7 @@ def train(args):
 
     accelerator.end_training()
 
-    if args.save_state:
+    if args.save_state and is_main_process:
         train_util.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
