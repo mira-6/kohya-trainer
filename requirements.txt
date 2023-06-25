@@ -22,5 +22,11 @@ fairscale==0.4.13
 # tensorflow<2.11
 tensorflow==2.10.1
 huggingface-hub==0.13.3
+# for colab
+gallery-dl==1.25.1
+gdown==4.7.1
+imjoy-elfinder==0.1.61
+dadaptation==1.5
+lion-pytorch==0.0.6
 # for kohya_ss library
 .
