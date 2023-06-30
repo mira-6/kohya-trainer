@@ -30,5 +30,6 @@ dadaptation==1.5
 lion-pytorch==0.0.6
 dadaptation==3.1
 lycoris-lora
+dowg
 # for kohya_ss library
 .
