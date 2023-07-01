@@ -12,6 +12,10 @@ Github Repository for [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scrip
 
 ## Updates
 #### 2023
+##### v0.0.2 (1/7):
+__What Changes?__
+- Added experimental DoWG support.
+
 ##### v0.0.1 (25/6):
 __What Changes?__
 - Update sd-scripts version.
