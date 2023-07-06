@@ -28,4 +28,4 @@ __What Changes?__
 - Add CosineAnnealingWarmupRestarts scheduler. (Thanks derrian_distro!)
 
 ## Credit
-[Kohya](https://twitter.com/kohya_ss) | [Lopho](https://github.com/lopho/stable-diffusion-prune) for prune script | Just for my part
+[Kohya](https://twitter.com/kohya_ss) | [Lopho](https://github.com/lopho/stable-diffusion-prune) for prune script | Linaqruf | derrian_distro
