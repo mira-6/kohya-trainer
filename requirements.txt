@@ -29,6 +29,7 @@ imjoy-elfinder==0.1.61
 lion-pytorch==0.0.6
 dadaptation==3.1
 lycoris-lora
+open-clip-torch
 dowg
 # for kohya_ss library
 .
